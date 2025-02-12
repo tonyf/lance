@@ -141,6 +141,8 @@ class _BaseLanceDatasink(ray.data.Datasink):
             op = lance.LanceOperation.Overwrite(schema, fragments)
         elif self.mode == "append":
             op = lance.LanceOperation.Append(fragments)
+        elif self.mode == "merge":
+            op = lance.LanceOperation.Merge(fragments, schema)
         lance.LanceDataset.commit(
             self.uri,
             op,
@@ -346,6 +348,73 @@ class LanceFragmentWriter:
             }
         )
 
+def read_lance_fragments(
+    uri: str,
+    *,
+    storage_options: Optional[Dict[str, str]] = None,
+) -> ray.data.Dataset:
+    ds = lance.dataset(uri, storage_options=storage_options)
+    fragments = [
+        {"fragment_id": fragment.fragment_id} for fragment in ds.get_fragments()
+    ]
+
+    return ray.data.from_items(fragments, override_num_blocks=len(fragments))
+
+
+class LanceMergeColumns:
+    """
+    Merge columns from multiple fragments into a single fragment.
+
+    Usage:
+    read_lance_fragments(uri)
+    .map_batches(LanceMergeColumns(uri, transform=lambda x: x, read_columns=["col1", "col2"]))
+    .write_datasink(LanceCommitter(uri, mode="merge"))
+
+    Parameters
+    ----------
+    uri : str
+        The base URI of the dataset.
+    transform : Callable[[pa.Table], Union[pa.Table, Generator]], optional
+        A callable to transform the input batch. Default is None.
+    schema : pyarrow.Schema, optional
+        The schema of the dataset.
+    read_columns : List[str], optional
+        The columns to read from the fragments.
+    batch_size : int, optional
+        The batch size. Default is None.
+    """
+    def __init__(
+        self,
+        uri: str,
+        *,
+        transform: Optional[Callable[[pa.Table], Union[pa.Table, Generator]]] = None,
+        schema: Optional[pa.Schema] = None,
+        read_columns: List[str] = None,
+        batch_size: int | None = None,
+    ):
+        self.ds = lance.dataset(uri)
+        self.schema = schema
+        self.transform = transform if transform is not None else lambda x: x
+        self.read_columns = read_columns
+        self.batch_size = batch_size
+
+    def __call__(self, batch: Union[pa.Table, "pd.DataFrame"]) -> Dict[str, Any]:
+        """Write a Batch to the Lance fragment."""
+
+        commit_messages = []
+        for fragment_id in batch["fragment_id"]:
+            fragment = self.ds.get_fragment(fragment_id)
+            new_fragment, new_schema = fragment.merge_columns(
+                self.transform, self.read_columns, batch_size=self.batch_size
+            )
+            commit_messages.append(
+                {
+                    "fragment": pickle.dumps(new_fragment),
+                    "schema": pickle.dumps(new_schema),
+                }
+            )
+
+        return pa.Table.from_pylist(commit_messages)
 
 class LanceCommitter(_BaseLanceDatasink):
     """Lance Commiter as Ray Datasink.
